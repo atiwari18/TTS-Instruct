@@ -3,6 +3,10 @@ import librosa
 import soundfile as sf
 
 SR = 24_000
+PERIOD_PAUSE = 0.75
+EQUAL_PAUSE = 1.4
+LONG_PAUSE = 2.5
+END = 0.0
 
 def load_audio(path):
     #sr=SR forces the resampling to SR
@@ -14,19 +18,25 @@ def silence(seconds):
 
 # (clip, pause_after_in_seconds)
 SCRIPT = [
-    ("./interlock/interlock_intro.mp3", 0.75), 
-    ("./interlock/interlock_goal.mp3", 0.75),
-    ("./interlock/interlock_how_it_works.mp3", 1), 
-    ("./interlock/interlock_option_one.mp3", 2), 
-    ("./interlock/interlock_sum_example.mp3", 1), 
-    ("./interlock/interlock_option_two.mp3", 2), 
-    ("./interlock/interlock_exact_match.mp3", 1.25),
-    ("./interlock/interlock_difference_one.mp3", 1.25), 
-    ("./interlock/interlock_difference_two_three.mp3", 1), 
-    ("./interlock/interlock_then_link_v2.mp3", 1),
-    ("./interlock/interlock_single_die.mp3", 0.75),
-    ("./interlock/interlock_thats_it.mp3", 0.75), 
-    ("./interlock/interlock_ready.mp3", 0.75)
+    ("./tether/tts-celeste-01.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-02.mp3", PERIOD_PAUSE),
+    ("./tether/tts-celeste-03.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-04.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-05.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-06.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-07.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-08.mp3", PERIOD_PAUSE),
+    ("./tether/tts-celeste-09.mp3", PERIOD_PAUSE),
+    ("./tether/tts-celeste-10.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-11.mp3", PERIOD_PAUSE), 
+
+    ("./tether/tts-celeste-12.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-13.mp3", PERIOD_PAUSE),  
+    ("./tether/tts-celeste-14.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-15.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-16.mp3", PERIOD_PAUSE), 
+    ("./tether/tts-celeste-17.mp3", PERIOD_PAUSE),
+    ("./tether/tts-celeste-18.mp3", END) 
 ]
 
 pieces = []
@@ -37,4 +47,4 @@ for i, (path, pause) in enumerate(SCRIPT):
 
 
 full = np.concatenate(pieces)
-sf.write("interlock_full_longer_pause.wav", full, SR)
+sf.write("tether_3.wav", full, SR)

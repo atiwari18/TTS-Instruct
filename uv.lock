@@ -2527,6 +2527,7 @@ dependencies = [
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchcodec" },
+    { name = "transformers" },
 ]
 
 [package.metadata]
@@ -2536,6 +2537,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchaudio", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchcodec", specifier = ">=0.17.0" },
+    { name = "transformers", specifier = ">=5.20.2" },
 ]
 
 [[package]]

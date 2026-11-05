@@ -122,7 +122,7 @@ def train_synthetic(model, tokenizer, scripts, num_gaps, budget_K, steps, group_
         script = scripts[step % len(scripts)]
 
         loss, avg_reward = grpo_step(
-            model, tokenizer, script, num_gaps, budget_K, 
+            model, tokenizer, script["text"], script["num_gaps"], script["budget_K"], 
             group_size=group_size, device=device
         )
 

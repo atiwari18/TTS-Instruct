@@ -30,6 +30,7 @@ class QwenBinaryClassifier(nn.Module):
             nn.Linear(hidden_size // 2, 2)
         )
 
+        self.classifier = self.classifier.to(torch.bfloat16)
         self.classifier = self.classifier.to(self.base_model.device)
 
     def forward(self, input_ids, attention_mask=None):
@@ -51,6 +52,6 @@ class QwenBinaryClassifier(nn.Module):
         last_hidden_states = hidden_states[torch.arange(batch_size, device=input_ids.device), sequence_lengths]
 
         #Pass the extracted hidden state through the classifier
-        logits = self.classifier(last_hidden_states)
+        logits = self.classifier(last_hidden_states).float()
 
         return {"logits": logits}

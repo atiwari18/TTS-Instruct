@@ -8,7 +8,7 @@ def parse_args():
     parser = argparse.ArgumentParser("GRPO RL Synthetic RUN")
 
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B-Base")
-    parser.add_argument("--save_dir", type=str, default="saved_policy/nov-6-2026-run")
+    parser.add_argument("--save_dir", type=str, default="saved_policy/nov-7-2026-testrun-2")
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--group_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -28,10 +28,11 @@ if __name__ == "__main__":
     grpo = GRPO()
 
     #Load Scipts
-    script1 = load_script("scripts\\script1.txt")
-    script2 = load_script("scripts\\script2.txt")
+    script1 = load_script("./scripts//script1.txt")
+    script2 = load_script("./scripts//script2.txt")
+    script3 = load_script("./scripts//script3.txt")
     scripts = [script1, script2]
 
-    #grpo.train_synthetic(model, tokenizer, scripts, args.steps, args.group_size, args.lr, args.save_dir)
+    grpo.train_synthetic(model, tokenizer, scripts, args.steps, args.group_size, args.lr, args.save_dir)
 
-    grpo.evaluate_policy(model, tokenizer, script2, 30, args.save_dir, device="cuda")
+    grpo.evaluate_policy(model, tokenizer, script3, 30, args.save_dir, device="cuda")

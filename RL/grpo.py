@@ -3,58 +3,83 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from utils.utils import save_policy
 import numpy as np
+from pathlib import Path
 
 class GRPO():
-    def __init__(self, model, tokenizer, scripts, num_gaps, budget_K, device):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.scripts = scripts
-
-    #Sample pause sequence 
-    def sample_pause_sequence(self, model, tokenizer, script_text, num_gaps, budget_K, device):
-        decisions = []
-        log_probs = []
+    def sample_pause_sequence(self, model, tokenizer, script_text, num_gaps, budget_K, keep_grad=False, decisions=None, device="cuda"):
+        is_sampling = decisions is None
+        sampled_decisions = [] if is_sampling else None
+        log_probs, free_mask = [], []
         remaining = budget_K
+        prev_decisions = []
 
         for gap_idx in range(num_gaps):
-            #build a simple prompt for the model
+            forced = (remaining == 0) or (remaining == num_gaps - gap_idx)
             prompt = (
                 f"Script:\n{script_text}\n\n"
-                f"Gap {gap_idx+1}/{num_gaps}. "
+                f"Gap {gap_idx + 1}/{num_gaps}. "
                 f"Pauses left to place: {remaining}. "
-                f"Previous decisions: {decisions}\n"
-                f"Should we place a pause here?"
+                f"Previous decisions: {prev_decisions}\n"
+                f"Should we place a pause here? Answer with 0 (no) or 1 (yes)."
             )
 
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            with torch.no_grad():
-                out = model(**inputs)
-                logits = out["logits"]
-                probs = F.softmax(logits, dim=-1)
+            if is_sampling:
+                with torch.no_grad():
+                    out = model(**inputs)
+                    # Critical: move to float32 before softmax
+                    logits = out["logits"].float()
+                    probs = F.softmax(logits, dim=-1)
 
-            #If not budget left then "no pause"
-            if remaining == 0:
-                action = 0
+                    # Hard safety against numerical issues
+                    probs = torch.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0)
+                    probs = torch.clamp(probs, min=1e-8, max=1.0)
+                    probs = probs / probs.sum(dim=-1, keepdim=True)
 
-            #If we must place all remaining pauses we force pause
-            elif remaining == (num_gaps - gap_idx):
-                action = 1
+                # Hard constraints
+                if remaining == 0:
+                    action = 0
+                elif remaining == (num_gaps - gap_idx):
+                    action = 1
+                else:
+                    # Final safety check before multinomial
+                    if torch.isnan(probs).any() or (probs < 0).any() or (probs > 1).any():
+                        print(f"[WARNING] Invalid probs at gap {gap_idx}: {probs}")
+                        probs = torch.tensor([[0.5, 0.5]], device=device)
+                    action = torch.multinomial(probs, num_samples=1).item()
 
-            #Sample from the probabilites
+                sampled_decisions.append(action)
             else:
-                action = torch.multinomial(probs, num_samples=1).item()
+                # Recompute path (for gradients)
+                action = decisions[gap_idx]
+                if keep_grad:
+                    out = model(**inputs)
+                else:
+                    with torch.no_grad():
+                        out = model(**inputs)
 
-            #recod logprov of the chosen action
+                logits = out["logits"].float()
+                probs = F.softmax(logits, dim=-1)
+                probs = torch.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0)
+                probs = torch.clamp(probs, min=1e-8, max=1.0)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+
+            # Record log-prob of the taken action
             log_prob = torch.log(probs[0, action] + 1e-10)
             log_probs.append(log_prob)
+            free_mask.append(0.0 if forced else 1.0)
 
-            decisions.append(action)
+            # Update state
             if action == 1:
                 remaining -= 1
+            prev_decisions.append(action)
 
-        return decisions, log_probs
+        if is_sampling:
+            return sampled_decisions, None
+        else:
+            return decisions, log_probs, free_mask
 
     def synthetic_reward(self, decisions, K):
         positions = []
@@ -70,53 +95,45 @@ class GRPO():
 
         return avg_pos / (len(decisions) - 1)
 
-    def grpo_steps(self, model, tokenizer, script_text, num_gaps, budget_K, group_size, clip_eps=0.1, device="cuda"):
+    def grpo_steps(self, model, tokenizer, script_text, num_gaps, budget_K, group_size, device="cuda"):
         model.train()
         all_decisions = []
-        all_logprobs = []
         rewards = []
 
-        #Sampling phase
+        #Sampling
         for _ in range(group_size):
-            decisions, log_probs = self.sample_pause_sequence(
-                model, tokenizer, script_text, num_gaps, budget_K, device
+            decisions, _ = self.sample_pause_sequence(
+                model, tokenizer, script_text, num_gaps, budget_K,
+                keep_grad=False, decisions=None, device=device
             )
-
             all_decisions.append(decisions)
-            all_logprobs.append(log_probs)
-
-            #Add rewards
             rewards.append(self.synthetic_reward(decisions, budget_K))
 
         rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
 
-        #CALCULATING ADVANTAGE GRPO CORE
+        #Advantage with group normalization
         mean_r = rewards.mean()
-        std_r = rewards.std() + 1e-8
+        std_r = rewards.std(unbiased=False) + 1e-8
         advantages = (rewards - mean_r) / std_r
 
-        #Compute Loss
-        # We need the log-probability of each full sequence under the *current* policy
-        # because we already sampled with torch.no_grad, we re-compute the log-probs
-        # with gradients enabled (this is the standard way).
-
+        #Policy gradient phase
         policy_loss = 0.0
         for i in range(group_size):
-            decisions = all_decisions[i]
+            _, log_probs, free_mask = self.sample_pause_sequence(
+                model, tokenizer, script_text, num_gaps, budget_K,
+                keep_grad=True, decisions=all_decisions[i], device=device
+            )
 
-            #Sum of log-probabilites
-            seq_logprob = torch.stack(all_logprobs[i]).sum()
+            lp = torch.stack(log_probs)
+            mask = torch.tensor(free_mask, device=device)
+            if mask.sum() == 0:
+                continue
 
-            #Importance ratio
-            ratio = torch.exp(seq_logprob = seq_logprob.detach())
-
-            adv = advantages[i]
-            unclipped = ratio * adv
-            clipped = torch.clamp(ratio, 1-clip_eps, 1+clip_eps) * adv
-            policy_loss = policy_loss - torch.min(unclipped, clipped)
+            seq_logprob = (lp * mask).sum()
+            adv = torch.clamp(advantages[i], -1.5, 1.5)
+            policy_loss = policy_loss - (seq_logprob * adv)
 
         policy_loss = policy_loss / group_size
-
         return policy_loss, rewards.mean().item()
 
     def evaluate_policy(self, model, tokenizer, script, num_samples, save_dir, device="cuda"):
@@ -138,18 +155,18 @@ class GRPO():
         avg_reward = sum(rewards) / len(rewards)
 
         save_dir = save_dir + "/policy_evaluation.txt"
+        Path(save_dir).parent.mkdir(parents=True, exist_ok=True)
+
         with open(save_dir, "w") as file:
             print(f"Average synthetic reward on novel script: {avg_reward:.3f}")
             file.write(f"Average synthetic reward on novel script: {avg_reward:.3f}\n\n")
 
-            
-            for script, pause_duration in zip(script["text"], decisions[20]):
-
+            for script, pause_duration in zip(script["sentences"], all_decisions[20]):
                 if pause_duration == 1:
-                    text = script + " " + "[PAUSE]" + " "
+                    text = script + " " + "[PAUSE]" + " \n"
                     file.write(text)
                 else:
-                    text = script + " " + "[NO PAUSE]" + " "
+                    text = script + " " + "[NO PAUSE]" + " \n"
                     file.write(text)
 
         return
@@ -163,7 +180,7 @@ class GRPO():
             #pick one script 
             script = scripts[step % len(scripts)]
 
-            loss, avg_reward = self.grpo_step(
+            loss, avg_reward = self.grpo_steps(
                 model, tokenizer, script["text"], script["num_gaps"], script["budget_K"], 
                 group_size=group_size, device=device
             )
@@ -172,7 +189,7 @@ class GRPO():
             loss.backward()
             optimizer.step()
 
-            if step % 20 == 0:
+            if step % 5 == 0:
                 print(f"Step {step:4d} | loss {loss.item():.4f} | avg reward {avg_reward:.3f}")
 
         save_policy(model, save_dir)

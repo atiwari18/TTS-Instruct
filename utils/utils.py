@@ -6,7 +6,7 @@ def load_script(path: str):
     text = Path(path).read_text(encoding="utf-8").strip()
 
     #Split on punctuation (. ? !)
-    sentences = re.split(r'[.!?]', text)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
     sentences = [s.strip() for s in sentences if s.strip()]
 
     num_gaps = len(sentences) - 1

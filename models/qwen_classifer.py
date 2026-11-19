@@ -6,6 +6,8 @@ class QwenBinaryClassifier(nn.Module):
     def __init__(self, model_name="Qwen/Qwen3-8B-Base", freeze_base=True):
         super().__init__()
 
+        self.freeze_base = freeze_base
+
         #Load the base model WITHOUT its language modeling head. 
         #AutoModel gives us the raw hidden states isntead of next-token prediction logit.
         self.base_model = AutoModel.from_pretrained(
@@ -16,8 +18,8 @@ class QwenBinaryClassifier(nn.Module):
 
         #Freeze LLM weights
         if freeze_base:
-            for param in self.base_model.parameters():
-                param.requires_grad = False
+            self.base_model.requires_grad_(False)
+            self.base_model.eval()
 
         #Hidden deminasions from the model config
         hidden_size = self.base_model.config.hidden_size
@@ -28,30 +30,34 @@ class QwenBinaryClassifier(nn.Module):
             nn.Linear(hidden_size, hidden_size // 2), 
             nn.ReLU(), 
             nn.Linear(hidden_size // 2, 2)
-        )
+        ).to(device="cuda", dtype=torch.float32)
 
-        self.classifier = self.classifier.to(torch.bfloat16)
-        self.classifier = self.classifier.to(self.base_model.device)
+        #Start the GRPRO with equal scores for each candidate
+        nn.init.zeros_(self.classifier[-1].weight)
+        nn.init.zeros_(self.classifier[-1].bias)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_base:
+            self.base_model.eval()
+        return self
 
     def forward(self, input_ids, attention_mask=None):
-        #Pass token_ids through base LLM
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+        track_base_grad = torch.is_grad_enabled() and not self.freeze_base
 
-        #hidden_state: (batch, sequence_len, hidden_size)
-        hidden_states = outputs.last_hidden_state
+        with torch.set_grad_enabled(track_base_grad):
+            #Pass token_ids through base LLM
+            hidden = self.base_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
-        batch_size = input_ids.shape[0]
+        if attention_mask is None:
+            pooled = hidden[:, -1]
+        else:
+            mask = attention_mask.to(device=hidden.device, dtype=torch.bool)
+            positions = torch.arange(hidden.shape[1], device=hidden.device)
+            last_indices = positions.masked_fill(~mask, -1).amax(dim=1)
+            rows = torch.arange(hidden.shape[0], device=hidden.device)
+            pooled = hidden[rows, last_indices]
 
-        #Find the index of last token for each sequence in the batch.
-        if attention_mask is not None:
-            sequence_lengths = attention_mask.sum(dim=1) - 1
-        else: 
-            sequence_lengths = torch.tensor( [input_ids.shape[1] - 1] * batch_size, device=input_ids.device)
-
-        #Extract onlt the hidden state of the last token
-        last_hidden_states = hidden_states[torch.arange(batch_size, device=input_ids.device), sequence_lengths]
-
-        #Pass the extracted hidden state through the classifier
-        logits = self.classifier(last_hidden_states).float()
-
-        return {"logits": logits}
+        pooled = pooled.to(self.classifier[1].weight)
+        
+        return {"logits": self.classifier(pooled)}

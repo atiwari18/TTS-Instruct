@@ -2,7 +2,7 @@ import re
 import torch 
 from pathlib import Path
 
-def load_script(path: str):
+def load_script(path: str, K: int = None):
     text = Path(path).read_text(encoding="utf-8").strip()
 
     #Split on punctuation (. ? !)
@@ -11,11 +11,16 @@ def load_script(path: str):
 
     num_gaps = len(sentences) - 1
 
+    if K is None:
+        budget = max(1, num_gaps // 3)
+    else:
+        budget = K
+
     return {
         "text" : text, 
         "sentences" : sentences, 
         "num_gaps" : num_gaps, 
-        "budget_K" : max(1, num_gaps // 3)
+        "budget_K" : budget
     }
 
 def save_policy(model, save_dir):

@@ -1,142 +1,122 @@
+import math
+from pathlib import Path
 import torch
-import torch.nn.functional as F
 from torch.optim import AdamW
 from utils.utils import save_policy
-import numpy as np
-from pathlib import Path
 
 class GRPO():
-    def sample_pause_sequence(self, model, tokenizer, script_text, num_gaps, budget_K, keep_grad=False, decisions=None, device="cuda"):
-        is_sampling = decisions is None
-        sampled_decisions = [] if is_sampling else None
-        log_probs, free_mask = [], []
-        remaining = budget_K
-        prev_decisions = []
+    def __init__(self, exploration=0.1):
+        if not 0 <= exploration < 1:
+            raise ValueError("exploration must be in [0, 1)")
+        
+        self.exploration = exploration
+        self.max_prompt_tokens=4096
 
-        for gap_idx in range(num_gaps):
-            forced = (remaining == 0) or (remaining == num_gaps - gap_idx)
-            prompt = (
-                f"Script:\n{script_text}\n\n"
-                f"Gap {gap_idx + 1}/{num_gaps}. "
-                f"Pauses left to place: {remaining}. "
-                f"Previous decisions: {prev_decisions}\n"
-                f"Should we place a pause here? Answer with 0 (no) or 1 (yes)."
-            )
+    def sample_pause_sequence(self, model, tokenizer, sentences, budget):
+        numbered_script = "\n".join(
+            f"[{i}] {sentence}"
+            for i, sentence in enumerate(sentences, start=1)
+        )
+        decisions = []
+        selected = []
+        rollout_log_prob = torch.zeros((), device="cuda")
 
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+        for boundary in range(1, len(sentences) + 1):
+            pauses_left = budget - len(selected)
+            boundaries_left = len(sentences) - boundary + 1
 
-            if is_sampling:
-                with torch.no_grad():
-                    out = model(**inputs)
-                    # Critical: move to float32 before softmax
-                    logits = out["logits"].float()
-                    probs = F.softmax(logits, dim=-1)
-
-                    # Hard safety against numerical issues
-                    probs = torch.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0)
-                    probs = torch.clamp(probs, min=1e-8, max=1.0)
-                    probs = probs / probs.sum(dim=-1, keepdim=True)
-
-                # Hard constraints
-                if remaining == 0:
-                    action = 0
-                elif remaining == (num_gaps - gap_idx):
-                    action = 1
-                else:
-                    # Final safety check before multinomial
-                    if torch.isnan(probs).any() or (probs < 0).any() or (probs > 1).any():
-                        print(f"[WARNING] Invalid probs at gap {gap_idx}: {probs}")
-                        probs = torch.tensor([[0.5, 0.5]], device=device)
-                    action = torch.multinomial(probs, num_samples=1).item()
-
-                sampled_decisions.append(action)
+            if pauses_left == 0:
+                action = 0
+            elif pauses_left == boundaries_left:
+                action = 1
             else:
-                # Recompute path (for gradients)
-                action = decisions[gap_idx]
-                if keep_grad:
-                    out = model(**inputs)
-                else:
-                    with torch.no_grad():
-                        out = model(**inputs)
+                prompt = (
+                    f"Full script:\n{numbered_script}\n\n"
+                    f"Consider a pause immediately after sentence [{boundary}].\n"
+                    f"Pauses already placed after sentences: {selected}.\n"
+                    f"Pauses left, including this boundary: {pauses_left}.\n"
+                    "Should a pause go here? Answer 0 (no) or 1 (yes):"
+                )
+                inputs = tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    truncation=False,
+                    return_token_type_ids=False,
+                )
+                if inputs["input_ids"].shape[1] > self.max_prompt_tokens:
+                    raise ValueError("Full script prompt exceeds the token limit")
 
-                logits = out["logits"].float()
-                probs = F.softmax(logits, dim=-1)
-                probs = torch.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0)
-                probs = torch.clamp(probs, min=1e-8, max=1.0)
-                probs = probs / probs.sum(dim=-1, keepdim=True)
+                inputs = {
+                    key: value.to(torch.device("cuda"))
+                    for key, value in inputs.items()
+                }
 
-            # Record log-prob of the taken action
-            log_prob = torch.log(probs[0, action] + 1e-10)
-            log_probs.append(log_prob)
-            free_mask.append(0.0 if forced else 1.0)
+                logits = model(**inputs)["logits"][0].float()
+                log_probs = logits.log_softmax(dim=-1)
 
-            # Update state
+                if self.exploration:
+                    q_yes = pauses_left / boundaries_left
+                    baseline = logits.new_tensor([1 - q_yes, q_yes])
+                    log_probs = torch.logaddexp(
+                        log_probs + math.log1p(-self.exploration),
+                        baseline.log() + math.log(self.exploration),
+                    )
+
+                action = torch.multinomial(log_probs.detach().exp(), 1).item()
+                rollout_log_prob = rollout_log_prob + log_probs[action]
+
+            decisions.append(action)
             if action == 1:
-                remaining -= 1
-            prev_decisions.append(action)
+                selected.append(boundary)
 
-        if is_sampling:
-            return sampled_decisions, None
-        else:
-            return decisions, log_probs, free_mask
+        return decisions, rollout_log_prob
 
-    def synthetic_reward(self, decisions, K):
-        positions = []
+    def longest_reward(self, decisions, sentences, budget):
+        # Length is measured in characters. Earlier sentences win ties.
+        target = set(sorted(range(len(sentences)), key=lambda i: -len(sentences[i]))[:budget])
 
-        for i, d in enumerate(decisions):
-            if d == 1:
-                positions.append(i)
+        chosen = {i for i, action in enumerate(decisions) if action == 1}
 
-        if len(positions) != K:
-            return 0.0
+        return len(chosen & target) / budget
 
-        avg_pos = sum(positions) / K
 
-        return avg_pos / (len(decisions) - 1)
+    def grpo_steps(self, model, tokenizer, script, group_size):
+        sentences, budget = script["sentences"], script["budget_K"]
 
-    def grpo_steps(self, model, tokenizer, script_text, num_gaps, budget_K, group_size, device="cuda"):
-        model.train()
-        all_decisions = []
+        if not sentences or not 0 <= budget <= len(sentences):
+            raise ValueError("Expected a nonempty script and a valid pause budget")
+        if group_size < 2:
+            raise ValueError("Need at least two rollouts per group")
+        if budget == 0 or budget == len(sentences):
+            return None, 1.0
+
+        model.eval()  # Gradients still flow through the classifier head.
+
         rewards = []
-
-        #Sampling
+        rollout_log_probs = []
         for _ in range(group_size):
-            decisions, _ = self.sample_pause_sequence(
-                model, tokenizer, script_text, num_gaps, budget_K,
-                keep_grad=False, decisions=None, device=device
-            )
-            all_decisions.append(decisions)
-            rewards.append(self.synthetic_reward(decisions, budget_K))
-
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
-
-        #Advantage with group normalization
-        mean_r = rewards.mean()
-        std_r = rewards.std(unbiased=False) + 1e-8
-        advantages = (rewards - mean_r) / std_r
-
-        #Policy gradient phase
-        policy_loss = 0.0
-        for i in range(group_size):
-            _, log_probs, free_mask = self.sample_pause_sequence(
-                model, tokenizer, script_text, num_gaps, budget_K,
-                keep_grad=True, decisions=all_decisions[i], device=device
+            decisions, log_prob = self.sample_pause_sequence(
+                model, tokenizer, sentences, budget
             )
 
-            lp = torch.stack(log_probs)
-            mask = torch.tensor(free_mask, device=device)
-            if mask.sum() == 0:
-                continue
+            reward = self.longest_reward(decisions, sentences, budget)
 
-            seq_logprob = (lp * mask).sum()
-            adv = torch.clamp(advantages[i], -1.5, 1.5)
-            policy_loss = policy_loss - (seq_logprob * adv)
+            rewards.append(reward)
+            rollout_log_probs.append(log_prob)
 
-        policy_loss = policy_loss / group_size
-        return policy_loss, rewards.mean().item()
+        log_probs = torch.stack(rollout_log_probs)
+        rewards = log_probs.new_tensor(rewards)
+        mean_reward = rewards.mean()
+        std_reward = rewards.std(unbiased=False)
 
-    def evaluate_policy(self, model, tokenizer, script, num_samples, save_dir, device="cuda"):
+        if std_reward.item() == 0:
+            return None, mean_reward.item()
+
+        advantages = (rewards - mean_reward) / std_reward
+        loss = -(log_probs * advantages).mean()
+        return loss, mean_reward.item()
+
+    def evaluate_policy(self, model, tokenizer, script, num_samples, save_dir):
         model.eval()
         rewards = []
         all_decisions = []
@@ -144,11 +124,9 @@ class GRPO():
         with torch.no_grad():
             for _ in range(num_samples):
                 decisions, _ = self.sample_pause_sequence(
-                            model, tokenizer, script["text"], 
-                            script["num_gaps"], script["budget_K"], device
-                        )
+                            model, tokenizer, script["sentences"], script["budget_K"])
 
-                r = self.synthetic_reward(decisions, script["budget_K"])
+                r = self.longest_reward(decisions, script["sentences"], script["budget_K"])
                 rewards.append(r)
                 all_decisions.append(decisions)
 
@@ -172,26 +150,30 @@ class GRPO():
         return
 
     def train_synthetic(self, model, tokenizer, scripts, steps, group_size, lr, save_dir):
-        
-        device = next(model.parameters()).device
+        if not scripts or steps < 1 or group_size < 2:
+            raise ValueError("Training needs scripts, steps >= 1, and group_size >= 2")
+
         optimizer = AdamW(model.classifier.parameters(), lr=lr)
+        updates = 0
+        total_reward = 0.0
 
         for step in range(steps):
-            #pick one script 
             script = scripts[step % len(scripts)]
+            optimizer.zero_grad(set_to_none=True)
+            loss, avg_reward = self.grpo_steps(model, tokenizer, script, group_size)
+            total_reward += avg_reward
 
-            loss, avg_reward = self.grpo_steps(
-                model, tokenizer, script["text"], script["num_gaps"], script["budget_K"], 
-                group_size=group_size, device=device
-            )
+            if loss is not None:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.classifier.parameters(), 1.0, error_if_nonfinite=True)
+                optimizer.step()
+                updates += 1
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            if step % 5 == 0:
-                print(f"Step {step:4d} | loss {loss.item():.4f} | avg reward {avg_reward:.3f}")
+            if (step + 1) % 5 == 0 or step == 0 or step + 1 == steps:
+                print(
+                    f"Step {step + 1:4d}/{steps} | mean reward "
+                    f"{total_reward / (step + 1):.3f} | updates {updates}/{step + 1}"
+                )
 
         save_policy(model, save_dir)
-
-        self.evaluate_policy(model, tokenizer, script, 30, save_dir, device="cuda")
+        self.evaluate_policy(model, tokenizer, script, 30, save_dir)

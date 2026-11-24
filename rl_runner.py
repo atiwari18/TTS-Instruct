@@ -8,7 +8,7 @@ def parse_args():
     parser = argparse.ArgumentParser("GRPO RL Synthetic RUN")
 
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B-Base")
-    parser.add_argument("--save_dir", type=str, default="saved_policy/nov-19-2026-run-1")
+    parser.add_argument("--save_dir", type=str, default="saved_policy/nov-23-2026-run-1")
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--group_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -25,7 +25,7 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = QwenBinaryClassifier(model_name, freeze_base=True)
+    model = QwenBinaryClassifier(model_name)
     grpo = GRPO()
 
     #Load Scipts

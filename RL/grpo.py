@@ -11,15 +11,63 @@ class GRPO():
         
         self.exploration = exploration
         self.max_prompt_tokens=4096
-
-    def sample_pause_sequence(self, model, tokenizer, sentences, budget):
+    def _get_action_log_probs(self, model, tokenizer, sentences, boundary, selected, budget):
         numbered_script = "\n".join(
             f"[{i}] {sentence}"
             for i, sentence in enumerate(sentences, start=1)
         )
+
+        pauses_left = budget - len(selected)
+        boundaries_left = len(sentences) - boundary + 1
+
+        prompt = (
+            f"Full script:\n{numbered_script}\n\n"
+            f"Consider a pause immediately after sentence [{boundary}].\n"
+            f"Pauses already placed after sentences: {selected}.\n"
+            f"Pauses left, including this boundary: {pauses_left}.\n"
+            "Should a pause go here? Answer 0 (no) or 1 (yes):"
+        )
+
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=False,
+            return_token_type_ids=False,
+        )
+
+        if inputs["input_ids"].shape[1] > self.max_prompt_tokens:
+            raise ValueError("Full script prompt exceeds the token limit")
+
+        device = next(model.parameters()).device
+
+        inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+        }
+
+        logits = model(**inputs)["logits"][0].float()
+        log_probs = logits.log_softmax(dim=-1)
+
+        #Preserve original exploration
+        if self.exploration:
+            yes = pauses_left / boundaries_left
+
+            baseline = logits.new_tensor(
+                [1 - yes, yes]
+            )
+
+            log_probs = torch.logaddexp(
+                log_probs + math.log1p(-self.exploration), 
+                baseline.log() + math.log(self.exploration)
+            )
+
+        return log_probs
+
+    @torch.no_grad()
+    def sample_pause_sequence(self, model, tokenizer, sentences, budget):
         decisions = []
         selected = []
-        rollout_log_prob = torch.zeros((), device="cuda")
+        free_decisions = []
 
         for boundary in range(1, len(sentences) + 1):
             pauses_left = budget - len(selected)
@@ -30,46 +78,46 @@ class GRPO():
             elif pauses_left == boundaries_left:
                 action = 1
             else:
-                prompt = (
-                    f"Full script:\n{numbered_script}\n\n"
-                    f"Consider a pause immediately after sentence [{boundary}].\n"
-                    f"Pauses already placed after sentences: {selected}.\n"
-                    f"Pauses left, including this boundary: {pauses_left}.\n"
-                    "Should a pause go here? Answer 0 (no) or 1 (yes):"
-                )
-                inputs = tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    truncation=False,
-                    return_token_type_ids=False,
-                )
-                if inputs["input_ids"].shape[1] > self.max_prompt_tokens:
-                    raise ValueError("Full script prompt exceeds the token limit")
+                # prompt = (
+                #     f"Full script:\n{numbered_script}\n\n"
+                #     f"Consider a pause immediately after sentence [{boundary}].\n"
+                #     f"Pauses already placed after sentences: {selected}.\n"
+                #     f"Pauses left, including this boundary: {pauses_left}.\n"
+                #     "Should a pause go here? Answer 0 (no) or 1 (yes):"
+                # )
+                # inputs = tokenizer(
+                #     prompt,
+                #     return_tensors="pt",
+                #     truncation=False,
+                #     return_token_type_ids=False,
+                # )
+                # if inputs["input_ids"].shape[1] > self.max_prompt_tokens:
+                #     raise ValueError("Full script prompt exceeds the token limit")
 
-                inputs = {
-                    key: value.to(torch.device("cuda"))
-                    for key, value in inputs.items()
-                }
+                # inputs = {
+                #     key: value.to(torch.device("cuda"))
+                #     for key, value in inputs.items()
+                # }
 
-                logits = model(**inputs)["logits"][0].float()
-                log_probs = logits.log_softmax(dim=-1)
+                log_probs = self._get_action_log_probs(model, tokenizer, sentences, boundary, selected, budget)
 
-                if self.exploration:
-                    q_yes = pauses_left / boundaries_left
-                    baseline = logits.new_tensor([1 - q_yes, q_yes])
-                    log_probs = torch.logaddexp(
-                        log_probs + math.log1p(-self.exploration),
-                        baseline.log() + math.log(self.exploration),
-                    )
+                action = torch.multinomial(log_probs.exp(), 1).item()
 
-                action = torch.multinomial(log_probs.detach().exp(), 1).item()
-                rollout_log_prob = rollout_log_prob + log_probs[action]
+                free_decisions.append({
+                    "boundary" : boundary, 
+                    "selected_before" : selected.copy(), 
+                    "action": action
+                })
 
             decisions.append(action)
+
             if action == 1:
                 selected.append(boundary)
 
-        return decisions, rollout_log_prob
+        return {
+            "decisions" : decisions, 
+            "free_decisions" : free_decisions
+        }
 
     def longest_reward(self, decisions, sentences, budget):
         # Length is measured in characters. Earlier sentences win ties.
@@ -153,7 +201,13 @@ class GRPO():
         if not scripts or steps < 1 or group_size < 2:
             raise ValueError("Training needs scripts, steps >= 1, and group_size >= 2")
 
-        optimizer = AdamW(model.classifier.parameters(), lr=lr)
+        groups = [{"params": list(model.classifier.parameters()), "lr": lr}]
+        if model.use_lora:
+            lora_params = [p for p in model.backbone.parameters() if p.requires_grad]
+            assert lora_params, "No trainable LoRA parameters were found"
+            groups.insert(0, {"params": lora_params, "lr": 2e-4})
+
+        optimizer = AdamW(groups, weight_decay=0.01)
         updates = 0
         total_reward = 0.0
 

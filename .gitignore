@@ -222,6 +222,7 @@ __marimo__/
 #No MP3 files
 *.mp3
 *.wav
+*.out
 
 #Folders
 interlock/

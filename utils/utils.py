@@ -30,6 +30,9 @@ def save_policy(model, save_dir):
     #Save the classification head
     torch.save(model.classifier.state_dict(), save_dir / "classifier.pt")
 
-    print(f"Saved classification head to {save_dir}")
+    if model.use_lora:
+        model.backbone.save_pretrained(save_dir / "lora_adapter")
+
+    print(f"Saved classification head + lora adapter to {save_dir}")
 
     return    

@@ -37,8 +37,8 @@ class QwenBinaryClassifier(nn.Module):
         ).to(device="cuda", dtype=torch.float32)
 
         #Start the GRPRO with equal scores for each candidate
-        nn.init.zeros_(self.classifier[-1].weight)
-        nn.init.zeros_(self.classifier[-1].bias)
+        # nn.init.zeros_(self.classifier[-1].weight)
+        # nn.init.zeros_(self.classifier[-1].bias)
 
     def train(self, mode=True):
         super().train(mode)
